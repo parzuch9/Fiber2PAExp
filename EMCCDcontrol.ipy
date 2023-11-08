@@ -1,0 +1,1859 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Aug 29 10:45:18 2022
+
+@author: Jimenez Lab
+"""
+
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+import pickle
+from matplotlib.gridspec import GridSpec
+import random
+%matplotlib qt
+#Power Supply for LED
+import pyvisa
+#Quad/thermistors
+import nidaqmx
+from nidaqmx.constants import TerminalConfiguration
+#EMCCD
+from pylablib.devices import Andor # import Andor devices module
+cam = Andor.AndorSDK2Camera(temperature=-70) 
+print('Connected to {}'.format(cam))
+#sCMOS
+cam2 = Andor.AndorSDK3Camera() 
+print('Connected to {}'.format(cam2))
+#power meter
+import readThorlabsPM100D as pm100D # change wl and avg in module
+#flip stage
+import ftd2xx
+import ftd2xx.defines as constants
+#shutter
+import os
+from msl.equipment import EquipmentRecord, ConnectionRecord, Backend
+from msl.equipment.resources.thorlabs import MotionControl
+#ophir
+import win32com.client 
+#import data for thermistor
+import pandas
+from scipy.interpolate import interp1d
+df=pandas.read_excel("ThermData.xlsx", engine='openpyxl')
+#wb = xlrd.open_workbook("ThermData.xlsx")
+tempVal = df['Temp'] #Celsius
+resistance = df['Value'] #kOhms
+f = interp1d(resistance, tempVal, kind='cubic',bounds_error=False)
+
+
+########################### Setup ophir power meter ###############################
+
+OphirCOM = win32com.client.Dispatch("OphirLMMeasurement.CoLMMeasurement")
+OphirCOM.StopAllStreams() 
+OphirCOM.CloseAll()
+DeviceList = OphirCOM.ScanUSB()
+Device = DeviceList[0]
+DeviceHandle = OphirCOM.OpenUSBDevice(Device)	# open first device
+exists = OphirCOM.IsSensorExists(DeviceHandle, 0)
+if exists:
+    OphirCOM.SetRange(DeviceHandle, 0, 0)
+    ('AUTO', '3.00mW', '300uW', '30.0uW', '3.00uW', '300nW', '30.0nW', '3.00nW')
+
+def get_power_ophir(throw_away=1, throw_away2=1,DeviceHandle=DeviceHandle):
+    #tic = time.perf_counter()
+    OphirCOM.StartStream(DeviceHandle, 0)		# start measuring
+    time.sleep(.05)				# wait a little for data
+    data = OphirCOM.GetData(DeviceHandle, 0)
+    if len(data[0]) > 0:		# if any data available, print the first one from the batch
+        p = data[0][0];    
+        print('Reading = {0}, TimeStamp = {1}, Status = {2} '.format(data[0][0] ,data[1][0] ,data[2][0]))
+    else:
+        time.sleep(.05)				# wait a little for data
+        data = OphirCOM.GetData(DeviceHandle, 0)
+        if len(data[0]) > 0:
+            p = data[0][0];    
+            print('Reading = {0}, TimeStamp = {1}, Status = {2} '.format(data[0][0] ,data[1][0] ,data[2][0]))
+        else:
+            print('\nNo Sensor attached to {0} !!!'.format(Device))
+            p=np.nan
+        # Stop & Close all devices
+    OphirCOM.StopAllStreams()
+    #toc = time.perf_counter()
+    #print("time for frame: ", toc-tic)
+    return(p)
+########################### Setup quad detector ###############################
+
+quadDetector = nidaqmx.Task(new_task_name='quad')
+test = quadDetector.ai_channels.add_ai_voltage_chan("Dev4/ai4",terminal_config=TerminalConfiguration.RSE) # B-T
+test2 = quadDetector.ai_channels.add_ai_voltage_chan("Dev4/ai5",terminal_config=TerminalConfiguration.RSE) # L-R
+test3 = quadDetector.ai_channels.add_ai_voltage_chan("Dev4/ai6",terminal_config=TerminalConfiguration.RSE) # sum
+print('Connected to {}'.format(quadDetector))
+
+def readQuadDetector(nSamples, qdet = quadDetector):
+    qdetReadings = np.mean(qdet.read(number_of_samples_per_channel = nSamples),axis=1)
+    return qdetReadings
+
+########################## Setup thermistors ##################################
+
+thermistorsW = nidaqmx.Task(new_task_name = 'thermW')
+thermistorsR = nidaqmx.Task(new_task_name = 'thermR')
+test4 = thermistorsW.ao_channels.add_ao_voltage_chan('Dev4/ao0')
+test5 = thermistorsR.ai_channels.add_ai_voltage_chan("Dev4/ai0:3",min_val = -5.0, max_val = 5.0,terminal_config=TerminalConfiguration.RSE)
+
+def VoltAcrossTherm(myV=5.0):
+    thermistorsW.write(myV)
+
+def ReadVoltDropTherm(numSamples=1):
+    data = thermistorsR.read(numSamples)
+    return data
+
+def TempFromVolt(myVlist):
+    R1 = 7.5 #kohms
+    R2 = 27 #kohms
+    I = [[0]]*4
+    Rtherm = [[0]]*4
+    for i in range(len(myVlist)):
+        if i == 0 or i == 3:
+            I[i] = (5.0-myVlist[i][-1])/R1
+        else:
+            I[i] = (5.0-myVlist[i][-1])/R2
+        Rtherm[i] = myVlist[i][-1]/I[i]
+    return f(Rtherm)
+
+############################ Setup Shutter ####################################
+
+# ensure that the Kinesis folder is available on PATH
+os.environ['PATH'] += os.pathsep + 'C:/Program Files/Thorlabs/Kinesis'
+
+# rather than reading the EquipmentRecord from a database we can create it manually
+record = EquipmentRecord(
+    manufacturer='Thorlabs',
+    model='KSC101',
+    serial='68001764',  # update the serial number for your KSC101 (Kristen updated)
+    connection=ConnectionRecord(
+        backend=Backend.MSL,
+        address='SDK::Thorlabs.MotionControl.KCube.Solenoid.dll',
+    ),
+)
+# avoid the FT_DeviceNotFound error
+MotionControl.build_device_list()
+# connect to the KCube Solenoid
+shutter = record.connect()
+print('Connected to {}'.format(shutter))
+
+def is_open():
+    return shutter.get_operating_state() == 1
+
+# start polling at 200 ms
+shutter.start_polling(200)
+# set the operating mode to SC_OperatingModes.SC_Manual
+shutter.set_operating_mode('Manual')
+
+
+########################## Setup Flip Stage ###################################
+
+serial = b"37854196"
+
+# Raw byte commands for "MGMSG_MOT_MOVE_JOG".
+up_position = b"\x6A\x04\x00\x01\x21\x01"
+down_position = b"\x6A\x04\x00\x02\x21\x01"
+
+# Recommended d2xx setup instructions from Thorlabs.
+motor = ftd2xx.openEx(serial)
+print('Connected to {}'.format(motor.getDeviceInfo()['description']))
+#motor.get_device_info()
+motor.setBaudRate(115200)
+motor.setDataCharacteristics(constants.BITS_8, constants.STOP_BITS_1, constants.PARITY_NONE)
+time.sleep(.05)
+motor.purge()
+time.sleep(.05)
+motor.resetDevice()
+motor.setFlowControl(constants.FLOW_RTS_CTS, 0, 0)
+motor.setRts()
+
+def open_or_closed(motor=motor, vrb=True):
+  #determine if motor is open or closed
+  clsd_stat = b'*\x04\x06\x00\x81P\x01\x00\x02\x00\x00\x90' #closed byte status
+  opn_stat  = b'*\x04\x06\x00\x81P\x01\x00\x01\x00\x00\x90' #open byte status
+  st_bit = b"\x29\x04\x00\x00\x21\x01" #request status bits
+  
+  motor.write(st_bit); 
+  mot_stat = motor.read(12) #NOTE: EXACTLY 12 bits need to be read. If too many, python will freeze waiting for more. If too few, you won't get them all this time (but will get some next time you read)
+  if mot_stat == opn_stat: #shutter appears to be open
+   # if vrb: #verbose
+   #   print('Flipper appears to be open')
+    return 1 #1 for open
+  elif mot_stat == clsd_stat: #shutter appears to be closed
+   # if vrb: #verbose
+   #   print('Flipper appears to be closed')
+    return 0 #0 for closed
+  else:
+   # print('I am confused about the flipper position')
+    return 2 #2 for confused
+
+
+######################## Setup thorlabs PM100D ################################
+
+def get_power():
+     try:
+         p = pm100D.get_power()
+         if p<0:
+             p = pm100D.get_power()
+         p2 = pm100D.get_power()
+         while np.abs((p2-p)/p2)>0.25:
+             p = p2
+             p2 = pm100D.get_power()
+         p=p2
+     except:
+         print("PM error")
+         p = 0
+     return p
+ 
+#################### Setup photodiode readout #################################
+
+photodiode = nidaqmx.Task(new_task_name='photd')
+test6 = photodiode.ai_channels.add_ai_voltage_chan("Dev4/ai7",min_val = -5.0, max_val = 5.0,terminal_config=TerminalConfiguration.RSE) 
+
+def ReadVoltPhotoDiode(numSamples=1):
+    data = photodiode.read(numSamples)[0]
+    return data
+
+def PowerFromVolt(PDVolt):
+    LoadResist = 20000; #Ohms
+    Responsivity = 0.11; #A/W at 400nm
+    Current = PDVolt/LoadResist;
+    Power = Current/Responsivity;
+    return Power
+    
+
+######################### Setup LED power supply ##############################
+
+def KEI2231_Connect(rsrcString, getIdStr, timeout, doRst):
+    my_PS = rm.open_resource(rsrcString, baud_rate = 9600, data_bits = 8)	#opens desired resource and sets it variable my_instrument
+    my_PS.write_termination = '\n'
+    my_PS.read_termination = '\n'
+    my_PS.send_end = True
+    my_PS.StopBits = 1
+    # my_PS.flow_control =      # only available in PyVisa 1.9
+    #my_PS.baud_rate = 9600
+    if getIdStr == 1:
+        print(my_PS.query("*IDN?"))
+        #time.sleep(0.1)
+    my_PS.write('SYST:REM')
+    #print(my_PS.timeout)
+    my_PS.timeout = timeout
+    #print(my_PS.timeout)
+    if doRst == 1:
+        my_PS.write('*RST')
+        #time.sleep(0.1)
+    return my_PS
+
+def KEI2231A_Disconnect():
+    my_PS.write('SYST:LOC')
+    my_PS.close
+    return
+
+def KEI2231A_SelectChannel(myChan):
+    my_PS.write("INST:NSEL %d" % myChan)
+    #time.sleep(0.25)
+    return
+
+def KEI2231A_SetVoltage(myV):
+    my_PS.write("VOLT %f" % myV)
+    #time.sleep(0.24)
+    return
+
+def KEI2231A_SetCurrent(myI):
+    my_PS.write("CURR %f" % myI)
+    #time.sleep(0.24)
+    return
+
+def KEI2231A_SetCurrent2(myI):
+    my_PS.write("APP:CURR %(num)f %(num)f" % {"num":myI})
+    #time.sleep(0.24)
+    return
+
+def KEI2231A_OutputState(myState):
+    if myState == 0:
+        my_PS.write("OUTP 0")
+        #time.sleep(0.25)
+        #my_PS.write("OUT:ENAB 0")
+    else:
+        my_PS.write("OUTP 1")
+        #time.sleep(0.25)
+        #my_PS.write("OUT:ENAB 1")
+    #time.sleep(0.25)
+    return
+
+def KEI2231_Send(sndBuffer):
+    my_PS.write(sndBuffer)
+    return
+
+def KEI2231_Query(sndBuffer):
+    return my_PS.query(sndBuffer)
+
+    
+
+def powerOnLED(Ch=3, myV=3.1, myI=0.02):
+  #  rm = visa.ResourceManager()	# Opens the resource manager and sets it to variable rm
+  #  my_PS = KEI2231_Connect("ASRL5::INSTR", 1, 20000, 1)
+    KEI2231A_SelectChannel(1)
+    KEI2231A_SetCurrent(0)
+    KEI2231A_SetVoltage(0)
+    
+    KEI2231A_SelectChannel(2)
+    KEI2231A_SetCurrent(0)
+    KEI2231A_SetVoltage(0)
+  
+    Vmax = 3.50
+    KEI2231A_SelectChannel(Ch)
+    KEI2231A_SetCurrent(myI)
+    KEI2231A_SetVoltage(0)
+    KEI2231A_OutputState(1)
+    if 0<=myV<Vmax: # 8.5A is apparently the max value, TEC model CP85301534H
+  #      KEI2231A_SelectChannel(Ch)
+        KEI2231A_SetVoltage(myV)
+        plt.pause(0.001)
+    else:    
+        KEI2231A_SetVoltage(0)
+        plt.pause(0.001)
+        print("Voltage too high, set voltage to zero")
+   #     KEI2231A_SelectChannel(Ch)
+        #KEI2231A_SetCurrent(Imax)
+  #  KEI2231A_OutputState(1)
+    curr = KEI2231_Query("MEAS:CURR?")
+    volt = KEI2231_Query("MEAS:VOLT?")
+    print(curr,volt)
+    return curr,volt
+
+
+rm = pyvisa.ResourceManager()	# Opens the resource manager and sets it to variable rm
+my_PS = KEI2231_Connect("COM13", 1, 20000, 1)
+
+
+
+######################## Cool EMCCD and sCMOS ##########################################
+
+cam.set_temperature(temperature=-70, enable_cooler=True)
+cam2.set_temperature(temperature=-25, enable_cooler=True)
+
+def is_cam_cool(cam ,timeout=1200, period=20, *args, **kwargs):
+  mustend = time.time() + timeout
+  try:
+      while time.time() < mustend:
+        if cam.get_temperature_status() == "stabilized": 
+            print("temperature stabilized")
+            return True
+        print("waiting for temperature to stabilize, temp = ",cam.get_temperature())
+        print("status = ",cam.get_temperature_status())
+        time.sleep(period)
+      print("timeout, not yet stable")
+      return False
+  except KeyboardInterrupt:
+      pass
+  return
+
+is_cam_cool(cam)
+print("EMCCD temperature: ", cam.get_temperature())
+
+def is_cam_cool2(cam,temp=-25,timeout=1200, period=20, *args, **kwargs):
+  mustend = time.time() + timeout
+  try:
+      while time.time() < mustend:
+          if cam.get_temperature() == temp: 
+              print("temperature stabilized")
+              return True
+          print("waiting for temperature to stabilize, temp = ",cam.get_temperature())
+          time.sleep(period)
+      print("timeout, not yet stable")
+      return False
+  except KeyboardInterrupt:
+      pass
+  return
+
+#is_cam_cool2(cam2)
+print("sCMOS temperature: ", cam2.get_temperature())
+
+
+##################### Setup EMCCD Acquisiton parameters #########################
+#set exposure
+exp = cam.set_exposure(10)#(10); #sec
+
+#print(cam.get_all_amp_modes())       # use EM amp
+cam.set_amp_mode(oamp=0,preamp=1,hsspeed=3)     # use EM amp and preamp gain 1
+gain = 30
+cam.set_EMCCD_gain(gain) # Set gain
+#adjust binning to change bin size
+binning=24#24#34#24#24
+#adjust binning2 to quickly change ROI size
+binning2=24
+ROIx1=525-binning2*3# chose ROI based on where there is fluorescence using align_loop() function down below, ensure ROI is a multiple of binning
+ROIx2=645+binning2*3# ROI has built in extra superpixels (binning2*3) to account for potential signal beyond main ROI
+ROIy1=455-binning2*3#
+ROIy2=575+binning2*3#
+cam.set_roi(ROIx1, ROIx2, ROIy1, ROIy2, hbin=binning, vbin=binning) #set roi
+cam.set_vsspeed(3) #default is 3 (4.33us, 2=2.2us,1=1.13us,0=0.60us)
+#print(cam.get_full_info())
+
+sizeY=int((ROIy2-ROIy1)/binning)
+sizeX=int((ROIx2-ROIx1)/binning)
+
+#cam.setup_shutter("open")
+#cam.setup_shutter("closed")
+#time.sleep(1)
+
+#change filebase each time or overwrite previous data
+filebase ="E:/231106/test"
+imfile = filebase+"im.pkl"
+Bkgdfile = filebase+"Bkgd.pkl"
+powerfile = filebase+"power.pkl"
+powerOutfile = filebase+"powerOut.pkl"
+timefile = filebase+"time.pkl"
+staticfile = filebase+"static.pkl"
+tempfile = filebase+"temp.pkl"
+
+QE=0.8; #QE at 460nm
+CCDsens = 15.9; #electrons per A/D count
+
+def pint(value):
+    if value>=0:
+        return value
+    else:
+        return 0
+
+########### Measure power with flip stage power meter ########################
+
+def flip_power():
+    motor.write(down_position)
+    while open_or_closed()!=0:
+        time.sleep(0.01)               
+    print('Power meter down')
+    
+    Power = get_power()
+    
+    motor.write(up_position)
+    while open_or_closed()!=1:
+        time.sleep(0.01)
+    print('Power meter up')
+    
+    return Power
+
+########### Characterize baseline and dark rate ##############################
+
+def characterize_baseline_dark(exp=exp,sizeY=sizeY,sizeX=sizeX):
+    print('characterizing baseline')
+    cam.set_exposure(0.001) 
+    cam.setup_shutter("closed")
+    baseline = np.empty([sizeY,sizeX,0]);
+    frames = 96#2*192 #increase this number for more accurate result
+    i=0
+    #try to get sensor to correct temp
+    while i<frames/5:
+        cam.grab(frame_timeout=exp+1)
+        time.sleep(0.01)
+        i+=1
+    i=0
+    while i<frames:
+        baseline = np.dstack((baseline,cam.grab(frame_timeout=exp+1)[0]))
+        time.sleep(0.01)
+        i+=1
+    print('characterizing dark counts')
+    cam.set_exposure(exp)
+    print("exp: ", exp)
+    dark = np.empty([sizeY,sizeX,0]);
+    frames = 24#10#4#48 #increase this number for more accurate result
+    i=0
+    #try to get sensor to correct temp
+    time.sleep(120)
+    while i<frames/3:#5:
+        cam.grab(frame_timeout=exp+1)
+        time.sleep(0.01)
+        i+=1
+        
+    i=0
+    while i<frames:
+        dark = np.dstack((dark,cam.grab(frame_timeout=exp+1)[0]))
+        time.sleep(0.01)
+        i+=1
+    return baseline, dark
+
+############### C2PA measurements w/ shutter ############################################
+
+def image_loop():
+    #plt.ion()
+    Power = np.array([]);
+    Pow = np.empty([3]);
+    Time = np.empty([0]);
+    powerOut = np.empty([0]);
+    Temp = np.empty([0,4])
+    totalPhotonRate = np.array([]);
+    im = np.empty([sizeY,sizeX,0]);
+    imBkgd = np.empty([sizeY,sizeX,0]) #np.zeros([frames,40,40]);
+    
+    data = {}
+    #get camera settings
+    data['settings'] = cam.get_full_info()
+    tic = time.perf_counter()
+    #characterize baseline & dark counts (comment this out for quicker measurements and use an earlier measurements staticfile in analysis)
+    data['baseline'], data['dark'] = characterize_baseline_dark(exp)
+    
+    #try to get sensor to correct temperature
+    i=0
+    while i<24/3:#5:
+        cam.grab(frame_timeout=exp+1)
+        time.sleep(0.01)
+        i+=1
+        
+    #save staticfile data
+    Fstat = open(staticfile,'wb')
+    Fstat.close()
+    with open(staticfile, 'wb') as f:
+        pickle.dump(data,f)
+        
+    #move the power meter out of the beam
+    motor.write(up_position)
+    while open_or_closed()!=1:
+        time.sleep(0.01)
+    print('Power meter up')
+
+    #open camera shutter
+    cam.setup_shutter("open")
+    
+    #setup thermistors to measure fiber temperature
+    VoltAcrossTherm()
+    
+    try:
+        i=0
+        #clear files
+        Fim = open(imfile,'wb')
+        Fbkgd = open(Bkgdfile,'wb')
+        Fpow = open(powerfile,'wb')
+        FpowOut = open(powerOutfile,'wb')
+        Ftime = open(timefile,'wb')
+        Ftemp = open(tempfile,'wb')
+        Ftemp.close()
+        Ftime.close()
+        Fpow.close()
+        FpowOut.close()
+        Fim.close()
+        Fbkgd.close()
+        while True:
+            tic2 = time.perf_counter()
+            
+            #read fiber temp
+            Volt = ReadVoltDropTherm(1)
+            temp = TempFromVolt(Volt)
+            #print("temp:", temp)
+            Temp = np.vstack((Temp,temp))
+            
+            #randomly decide if background image is taken first or second
+            a = random.randint(0,1)
+            
+            if a==0:
+                #record time
+                Time = np.hstack((Time,time.time())) #time in seconds since the epoch
+                
+                #close shutter
+                print('Closing the shutter...')
+                shutter.set_operating_state('Inactive')
+                while is_open():
+                    time.sleep(0.01)
+                print('  Is the shutter open? {}'.format(is_open()))
+                
+                #take Bkgd images
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+                time.sleep(0.01)
+                
+                #open shutter
+                print('Opening the shutter...')
+                shutter.set_operating_state('Active')
+                while not is_open():
+                    time.sleep(0.01)
+                print('  Is the shutter open? {}'.format(is_open()))
+                
+                #measure power before fiber once every 10 frames (slower to do it more frequently)
+                if i % 10 ==0:
+                    Power = np.append(Power,flip_power())
+                
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+                
+                #measure power out of fiber
+                Pow[0] = get_power_ophir()
+                Pow[1] = get_power_ophir()
+                Pow[2] = get_power_ophir()
+                powerOut = np.hstack((powerOut,np.mean(Pow)))
+                time.sleep(0.01)
+                
+            else:
+                #record time
+                Time = np.hstack((Time,time.time())) #time in seconds since the epoch
+                
+                #open shutter
+                print('Opening the shutter...')
+                shutter.set_operating_state('Active')
+                while not is_open():
+                    time.sleep(0.01)
+                print('  Is the shutter open? {}'.format(is_open()))
+               
+                #measure power before fiber once every 10 frames (slower to do it more frequently)
+                if i % 10 ==0:
+                    Power = np.append(Power,flip_power())
+
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+                
+                #measure power out of fiber
+                Pow[0] = get_power_ophir()
+                Pow[1] = get_power_ophir()
+                Pow[2] = get_power_ophir()
+                powerOut = np.hstack((powerOut,np.mean(Pow)))
+                time.sleep(0.01)
+                
+                #close shutter
+                print('Closing the shutter...')
+                shutter.set_operating_state('Inactive')
+                while is_open():
+                    time.sleep(0.01)
+                print('  Is the shutter open? {}'.format(is_open()))
+            
+                #take Bkgd image   
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+                time.sleep(0.01)    
+
+                
+            #bkgd subtract the image 
+            BkgdSubIm=im[:,:,i].astype(float)-imBkgd[:,:,i].astype(float)
+            
+            #calculate total photon rate (not accurate for absolute #s)
+            totalPhotonRate = np.append(totalPhotonRate,np.sum(BkgdSubIm)*CCDsens/(gain*exp*QE))
+            print("power: ",Power[-1],"W, total photon count rate: ",totalPhotonRate[i], "/s")
+ 
+            #save data each frame in case measurement crashes before saving
+            with open(timefile, 'ab') as f:
+                pickle.dump(Time[i],f)
+            with open(powerOutfile, 'ab') as f:
+                pickle.dump(powerOut[i],f)
+            with open(imfile, 'ab') as f:
+                pickle.dump(im[:,:,i],f)
+            with open(Bkgdfile, 'ab') as f:
+                pickle.dump(imBkgd[:,:,i],f)
+            with open(tempfile, 'ab') as f:
+                pickle.dump(Temp[-1],f)
+            if i%10==0:
+                with open(powerfile, 'ab') as f:
+                    pickle.dump(Power[-1],f)
+
+            i+=1
+            toc2 = time.perf_counter()
+            print("time for frame: ", toc2-tic2)
+    
+    #stop measurement with control+c on console
+    except KeyboardInterrupt:
+        pass
+    
+    #close camera shutter
+    cam.setup_shutter("closed")
+    
+    #move the power meter out of the beam
+    motor.write(up_position)
+    while open_or_closed()!=1:
+        time.sleep(0.01)
+    print('Power meter up')
+    
+    
+    toc = time.perf_counter()    
+    print("time to acquire: ", toc-tic)
+    
+    return
+
+
+############ updated C2PA measurement function ################################
+# uses flip stage power meter instead of shutter ##############################
+
+def image_loop_2():
+    #plt.ion()
+    Power = np.array([]);
+    Pow = np.empty([3]);
+    Time = np.empty([0]);
+    powerOut = np.empty([0]);
+    Temp = np.empty([0,4])
+    totalPhotonRate = np.array([]);
+    im = np.empty([sizeY,sizeX,0]);
+    imBkgd = np.empty([sizeY,sizeX,0]); #np.zeros([frames,40,40]);
+    
+    data = {}
+    #get camera settings
+    data['settings'] = cam.get_full_info()
+    tic = time.perf_counter()
+    #characterize baseline & dark counts (comment this out for quicker measurements and use an earlier measurements staticfile in analysis)
+    data['baseline'], data['dark'] = characterize_baseline_dark()
+    
+    #try to get sensor to correct temperature
+    i=0
+    while i<24/3:#5:
+        cam.grab(frame_timeout=exp+1)
+        time.sleep(0.01)
+        i+=1
+
+    #save staticfile data
+    Fstat = open(staticfile,'wb')
+    Fstat.close()
+    with open(staticfile, 'wb') as f:
+        pickle.dump(data,f)
+        
+    #move the power meter out of the beam
+    motor.write(up_position)
+    while open_or_closed()!=1:
+        time.sleep(0.01)
+    print('Power meter up')
+    
+    #open shutter
+    # print('Opening the shutter...')
+    # shutter.set_operating_state('Active')
+    # while not is_open():
+    #     time.sleep(0.01)
+    # print('  Is the shutter open? {}'.format(is_open()))
+
+    #open camera shutter
+    cam.setup_shutter("open")
+    
+    #setup thermistors to measure fiber temperature
+    VoltAcrossTherm()
+    
+    try:
+        i=0
+        #clear files
+        Fim = open(imfile,'wb')
+        Fbkgd = open(Bkgdfile,'wb')
+        Fpow = open(powerfile,'wb')
+        FpowOut = open(powerOutfile,'wb')
+        Ftime = open(timefile,'wb')
+        Ftemp = open(tempfile,'wb')
+        Ftemp.close()
+        Ftime.close()
+        Fpow.close()
+        FpowOut.close()
+        Fim.close()
+        Fbkgd.close()
+        
+        while True:
+            tic2 = time.perf_counter()
+            
+            #read fiber temp
+            Volt = ReadVoltDropTherm(1)
+            temp = TempFromVolt(Volt)
+            #print("temp:", temp)
+            Temp = np.vstack((Temp,temp))
+            
+            #randomly decide if background image is taken first or second
+            a = random.randint(0,1)
+            
+            if a==0:
+                #record time
+                Time = np.hstack((Time,time.time())) #time in seconds since the epoch
+                
+                #move the power meter into the beam
+                motor.write(down_position)
+                while open_or_closed()!=0:
+                    time.sleep(0.01)               
+                print('Power meter down')
+                
+                #record the power before the fiber
+                Power = np.append(Power,get_power())
+                
+                #take Bkgd images
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+                time.sleep(0.01)
+                
+                #move the power meter out of the beam
+                motor.write(up_position)
+                while open_or_closed()!=1:
+                    time.sleep(0.01)
+                print('Power meter up')
+                
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+                
+                #record the power out of the fiber
+                Pow[0] = get_power_ophir()
+                Pow[1] = get_power_ophir()
+                Pow[2] = get_power_ophir()
+                powerOut = np.hstack((powerOut,np.mean(Pow)))
+                
+                time.sleep(0.01)
+                
+            else:
+                #record time
+                Time = np.hstack((Time,time.time())) #time in seconds since the epoch
+                
+                #move the power meter out of the beam
+                motor.write(up_position)
+                while open_or_closed()!=1:
+                    time.sleep(0.01)
+                print('Power meter up')
+
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+                
+                #record the power out of the fiber
+                Pow[0] = get_power_ophir()
+                Pow[1] = get_power_ophir()
+                Pow[2] = get_power_ophir()
+                powerOut = np.hstack((powerOut,np.mean(Pow)))
+                time.sleep(0.01)
+                
+                #move the power meter into the beam
+                motor.write(down_position)
+                while open_or_closed()!=0:
+                    time.sleep(0.01)               
+                print('Power meter down')
+                
+                #record the power before the fiber
+                Power = np.append(Power,get_power())
+                
+                #take Bkgd image   
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+                time.sleep(0.01)    
+
+                
+            #bkgd subtract the image 
+            BkgdSubIm=im[:,:,i].astype(float)-imBkgd[:,:,i].astype(float)
+            #AvgBkgdSubIm=np.sum(np.array(im[8:26,7:25,0:i+1],dtype=np.int16),axis=2)/(i+1)-np.sum(np.array(imBkgd[8:26,7:25,0:i+1],dtype=np.int16),axis=2)/(i+1)
+            
+            #calculate total photon rate (not accurate for absolute #s)
+            totalPhotonRate = np.append(totalPhotonRate,np.sum(BkgdSubIm)*CCDsens/(gain*exp*QE))
+            print("power: ",Power[-1],"W, total photon count rate: ",totalPhotonRate[i], "/s")
+ 
+            #save data each frame in case measurement crashes before saving
+            with open(timefile, 'ab') as f:
+                pickle.dump(Time[i],f)
+            with open(powerOutfile, 'ab') as f:
+                pickle.dump(powerOut[i],f)
+            with open(imfile, 'ab') as f:
+                pickle.dump(im[:,:,i],f)
+            with open(Bkgdfile, 'ab') as f:
+                pickle.dump(imBkgd[:,:,i],f)
+            with open(tempfile, 'ab') as f:
+                pickle.dump(Temp[-1],f)
+            with open(powerfile, 'ab') as f:
+                pickle.dump(Power[-1],f)
+
+            i+=1
+            toc2 = time.perf_counter()
+            print("time for frame: ", toc2-tic2)
+            
+    #stop measurement with control+c on console
+    except KeyboardInterrupt:
+        pass
+    
+    #close camera shutter
+    cam.setup_shutter("closed")
+    
+    #move the power meter out of the beam
+    motor.write(up_position)
+    while open_or_closed()!=1:
+        time.sleep(0.01)
+    print('Power meter up')
+    
+    toc = time.perf_counter()    
+    print("time to acquire: ", toc-tic)
+    
+    return
+
+##################### Setup SCMOS Acquisiton parameters #########################
+exp2 = cam2.set_exposure(0.5)#(10); #sec
+#switch to low noise mode (12-bit): 0, 16-bit: 1
+cam2.set_attribute_value('SimplePreAmpGainControl',0)
+SCMOSbin=64
+cam2.set_attribute_value('AOIVBin',SCMOSbin)
+cam2.set_attribute_value('AOIHBin',SCMOSbin)
+
+sizeYSCMOS=int(2048/SCMOSbin)
+sizeXSCMOS=int(2048/SCMOSbin)
+#filebase is defined in front of C2PA functions, change filebase or risk overwriting data
+SCMOSimfile = filebase+"SCMOSim.pkl"
+SCMOSBkgdfile = filebase+"SCMOSBkgd.pkl"
+SCMOSstaticfile = filebase+"SCMOSstatic.pkl"
+quadTempfile = filebase+"quad_temp.pkl"
+
+
+################## E2PA measurements w/ shutter ################################
+def image_loop_E2PA():
+
+    Time = np.empty([0]);
+    Temp = np.empty([0,4])
+    Quad = np.empty([0,3]);
+    imSCMOS = np.empty([sizeYSCMOS,sizeXSCMOS,0]);
+    imBkgdSCMOS = np.empty([sizeYSCMOS,sizeXSCMOS,0]) 
+    totalPhotonRate = np.array([]);
+    im = np.empty([sizeY,sizeX,0]);
+    imBkgd = np.empty([sizeY,sizeX,0]) 
+    
+    data = {}
+    #get camera settings
+    data['settings'] = cam.get_full_info()
+    tic = time.perf_counter()
+    #characterize baseline & dark counts (comment this out for quicker measurements and use an earlier measurements staticfile in analysis)
+    data['baseline'], data['dark'] = characterize_baseline_dark()
+    
+    SCMOSdata = {}
+    #get camera settings
+    SCMOSdata['settings'] = cam2.get_full_info()
+    
+    #try to get sensor to correct temperature
+    i=0
+    while i<24/3:#5:
+        cam.grab(frame_timeout=exp+1)
+        time.sleep(0.01)
+        i+=1
+
+    #clear files
+    Fstat = open(staticfile,'wb')
+    Fstat.close()    
+    Fstat2 = open(SCMOSstaticfile,'wb')
+    Fstat2.close()
+    
+    #save staticfile data
+    with open(staticfile, 'wb') as f:
+         pickle.dump(data,f)
+    with open(SCMOSstaticfile, 'wb') as f:
+        pickle.dump(SCMOSdata,f)
+
+    #open camera shutter
+    cam.setup_shutter("open")
+    
+    #setup thermistors to measure fiber temperature
+    VoltAcrossTherm()
+    
+    #move power meter out of beam
+    motor.write(up_position)
+    while open_or_closed()!=1:
+        time.sleep(0.01)
+    print('Power meter up')
+    
+
+    try:
+        i=0
+        #clear files
+        Fim = open(imfile,'wb')
+        Fbkgd = open(Bkgdfile,'wb')
+        FSim = open(SCMOSimfile,'wb')
+        FSbkgd = open(SCMOSBkgdfile,'wb')
+        Ftime = open(timefile,'wb')
+        FquadTemp = open(quadTempfile,'wb')
+        FquadTemp.close()
+        Ftime.close()
+        Fim.close()
+        Fbkgd.close()
+        FSim.close()
+        FSbkgd.close()
+        
+        while True:
+            tic2 = time.perf_counter()
+            
+            #read fiber temp
+            Volt = ReadVoltDropTherm(1)
+            temp = TempFromVolt(Volt)
+            #print("temp:", temp)
+            Temp = np.vstack((Temp,temp))
+            
+            #randomly decide if background image is taken first or second
+            a = random.randint(0,1)
+            
+            if a==0:
+                #record time
+                Time = np.hstack((Time,time.time())) #time in seconds since the epoch
+                
+                #close shutter
+                print('Closing the shutter...')
+                shutter.set_operating_state('Inactive')
+                while is_open():
+                    time.sleep(0.01)
+                print('  Is the shutter open? {}'.format(is_open()))
+                
+                #take Bkgd images
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+                imBkgdSCMOS = np.dstack((imBkgdSCMOS,cam2.grab(1)[0]))
+                time.sleep(0.01)
+                
+                #open shutter
+                print('Opening the shutter...')
+                shutter.set_operating_state('Active')
+                while not is_open():
+                    time.sleep(0.01)
+                print('  Is the shutter open? {}'.format(is_open()))
+                
+                #measure pump power
+                Quad = np.vstack((Quad,readQuadDetector(5)))
+                
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+                
+                #take sCMOS image for power out
+                imSCMOS = np.dstack((imSCMOS,cam2.grab(1)[0]))
+                time.sleep(0.01)
+                
+            else:
+                #record time
+                Time = np.hstack((Time,time.time())) #time in seconds since the epoch
+                
+                #open shutter
+                print('Opening the shutter...')
+                shutter.set_operating_state('Active')
+                while not is_open():
+                    time.sleep(0.01)
+                print('  Is the shutter open? {}'.format(is_open()))
+               
+                #measure pump power
+                Quad = np.vstack((Quad,readQuadDetector(5)))
+
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+                
+                #take sCMOS image for power out
+                imSCMOS = np.dstack((imSCMOS,cam2.grab(1)[0]))
+                time.sleep(0.01)
+                
+                #close shutter
+                print('Closing the shutter...')
+                shutter.set_operating_state('Inactive')
+                while is_open():
+                    time.sleep(0.01)
+                print('  Is the shutter open? {}'.format(is_open()))
+            
+                #take Bkgd image   
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+                imBkgdSCMOS = np.dstack((imBkgdSCMOS,cam2.grab(1)[0]))
+                time.sleep(0.01)    
+                
+
+                
+            #bkgd subtract the image 
+            BkgdSubIm=im[:,:,i].astype(float)-imBkgd[:,:,i].astype(float)
+            
+            #calculate total photon rate (not accurate for absolute #s)
+            totalPhotonRate = np.append(totalPhotonRate,np.sum(BkgdSubIm)*CCDsens/(gain*exp*QE))
+            print(" total photon count rate: ",totalPhotonRate[i], "/s")
+   
+            #save data each frame in case measurement crashes before saving
+            with open(timefile, 'ab') as f:
+                pickle.dump(Time[i],f)
+            with open(SCMOSimfile, 'ab') as f:
+                pickle.dump(imSCMOS[:,:,i],f)
+            with open(SCMOSBkgdfile, 'ab') as f:
+                pickle.dump(imBkgdSCMOS[:,:,i],f)
+            with open(imfile, 'ab') as f:
+                pickle.dump(im[:,:,i],f)
+            with open(Bkgdfile, 'ab') as f:
+                pickle.dump(imBkgd[:,:,i],f)
+            with open(quadTempfile, 'ab') as f:
+                pickle.dump([Quad[-1],Temp[-1]],f)
+
+            i+=1
+            toc2 = time.perf_counter()
+            print("time for frame: ", toc2-tic2)
+            
+    #stop measurement with control+c on console
+    except KeyboardInterrupt:
+        pass
+    
+    #close camera shutter
+    cam.setup_shutter("closed")
+    
+    #move the power meter out of the beam
+    motor.write(up_position)
+    while open_or_closed()!=1:
+        time.sleep(0.01)
+    print('Power meter up')
+    
+    toc = time.perf_counter()    
+    print("time to acquire: ", toc-tic)
+    
+    return
+
+
+################# Updated E2PA measurement function ##########################
+# with power meter flip stage instead of shutter ##############################
+def image_loop_E2PA_2():
+
+    Time = np.empty([0]);
+    Temp = np.empty([0,4])
+    Quad = np.empty([0,3]);
+    imSCMOS = np.empty([sizeYSCMOS,sizeXSCMOS,0]);
+    imBkgdSCMOS = np.empty([sizeYSCMOS,sizeXSCMOS,0]) 
+    totalPhotonRate = np.array([]);
+    im = np.empty([sizeY,sizeX,0]);
+    imBkgd = np.empty([sizeY,sizeX,0])
+    
+    data = {}
+    #get camera settings
+    data['settings'] = cam.get_full_info()
+    tic = time.perf_counter()
+    
+    #characterize baseline & dark counts (comment this out for quicker measurements and use an earlier measurements staticfile in analysis)
+    data['baseline'], data['dark'] = characterize_baseline_dark()
+    
+    SCMOSdata = {}
+    #get camera settings
+    SCMOSdata['settings'] = cam2.get_full_info()
+    
+    #try to get sensor to correct temperature
+    i=0
+    while i<24/3:#5:
+        cam.grab(frame_timeout=exp+1)
+        time.sleep(0.01)
+        i+=1
+
+    #clear files
+    Fstat = open(staticfile,'wb')
+    Fstat.close() 
+    Fstat2 = open(SCMOSstaticfile,'wb')
+    Fstat2.close()
+    
+    #save staticfile data
+    with open(staticfile, 'wb') as f:
+         pickle.dump(data,f)
+    with open(SCMOSstaticfile, 'wb') as f:
+        pickle.dump(SCMOSdata,f)
+
+    #open shutter
+    # print('Opening the shutter...')
+    # shutter.set_operating_state('Active')
+    # while not is_open():
+    #     time.sleep(0.01)
+    # print('  Is the shutter open? {}'.format(is_open()))
+
+    #open camera shutter
+    cam.setup_shutter("open")
+    
+    #setup thermistors to measure fiber temperature
+    VoltAcrossTherm()
+    
+    #move power meter out of the beam
+    motor.write(up_position)
+    while open_or_closed()!=1:
+        time.sleep(0.01)
+    print('Power meter up')
+    
+
+    try:
+        i=0
+        #clear files
+        Fim = open(imfile,'wb')
+        Fbkgd = open(Bkgdfile,'wb')
+        FSim = open(SCMOSimfile,'wb')
+        FSbkgd = open(SCMOSBkgdfile,'wb')
+        Ftime = open(timefile,'wb')
+        FquadTemp = open(quadTempfile,'wb')
+        FquadTemp.close()
+        Ftime.close()
+        Fim.close()
+        Fbkgd.close()
+        FSim.close()
+        FSbkgd.close()
+        
+        while True:
+            tic2 = time.perf_counter()
+            
+            #read fiber temp
+            Volt = ReadVoltDropTherm(1)
+            temp = TempFromVolt(Volt)
+            #print("temp:", temp)
+            Temp = np.vstack((Temp,temp))
+            
+            #randomly decide if background image is taken first or second
+            a = random.randint(0,1)
+            
+            if a==0:
+                #record time
+                Time = np.hstack((Time,time.time())) #time in seconds since the epoch
+                
+                #move the power meter into the beam
+                motor.write(down_position)
+                while open_or_closed()!=0:
+                    time.sleep(0.01)               
+                print('Power meter down')
+                
+                #take Bkgd images
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+                imBkgdSCMOS = np.dstack((imBkgdSCMOS,cam2.grab(1)[0]))
+                time.sleep(0.01)
+                
+                #move the power meter out of the beam
+                motor.write(up_position)
+                while open_or_closed()!=1:
+                    time.sleep(0.01)
+                print('Power meter up')
+                
+                #measure pump power
+                Quad = np.vstack((Quad,readQuadDetector(5)))
+                
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+                
+                #take sCMOS image for power out
+                imSCMOS = np.dstack((imSCMOS,cam2.grab(1)[0]))
+                time.sleep(0.01)
+                
+            else:
+                #record time
+                Time = np.hstack((Time,time.time())) #time in seconds since the epoch
+                
+                #move the power meter out of the beam
+                motor.write(up_position)
+                while open_or_closed()!=1:
+                    time.sleep(0.01)
+                print('Power meter up')
+                
+                #measure pump power
+                Quad = np.vstack((Quad,readQuadDetector(5)))
+
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+                
+                #take sCMOS image for power out
+                imSCMOS = np.dstack((imSCMOS,cam2.grab(1)[0]))
+                time.sleep(0.01)
+                
+                #move the power meter into the beam
+                motor.write(down_position)
+                while open_or_closed()!=0:
+                    time.sleep(0.01)               
+                print('Power meter down')
+            
+                #take Bkgd image   
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+                imBkgdSCMOS = np.dstack((imBkgdSCMOS,cam2.grab(1)[0]))
+                time.sleep(0.01)    
+                         
+            #bkgd subtract the image 
+            BkgdSubIm=im[:,:,i].astype(float)-imBkgd[:,:,i].astype(float)
+            #AvgBkgdSubIm=np.sum(np.array(im[8:26,7:25,0:i+1],dtype=np.int16),axis=2)/(i+1)-np.sum(np.array(imBkgd[8:26,7:25,0:i+1],dtype=np.int16),axis=2)/(i+1)
+            
+            #calculate total photon rate (not accurate for absolute #s)
+            totalPhotonRate = np.append(totalPhotonRate,np.sum(BkgdSubIm)*CCDsens/(gain*exp*QE))
+            print(" total photon count rate: ",totalPhotonRate[i], "/s")
+   
+            #save data each frame in case measurement crashes before saving
+            with open(timefile, 'ab') as f:
+                pickle.dump(Time[i],f)
+            with open(SCMOSimfile, 'ab') as f:
+                pickle.dump(imSCMOS[:,:,i],f)
+            with open(SCMOSBkgdfile, 'ab') as f:
+                pickle.dump(imBkgdSCMOS[:,:,i],f)
+            with open(imfile, 'ab') as f:
+                pickle.dump(im[:,:,i],f)
+            with open(Bkgdfile, 'ab') as f:
+                pickle.dump(imBkgd[:,:,i],f)
+            with open(quadTempfile, 'ab') as f:
+                pickle.dump([Quad[-1],Temp[-1]],f)
+
+            i+=1
+            toc2 = time.perf_counter()
+            print("time for frame: ", toc2-tic2)
+    #stop measurement with control+c on console
+    except KeyboardInterrupt:
+        pass
+    
+    #close camera shutter
+    cam.setup_shutter("closed")
+    
+    #move the power meter out of the beam
+    motor.write(up_position)
+    while open_or_closed()!=1:
+        time.sleep(0.01)
+    print('Power meter up')  
+    
+    toc = time.perf_counter()    
+    print("time to acquire: ", toc-tic)
+    
+    return
+
+
+########### function to check alignment of fluorescence on ROI ################
+
+def align_loop():
+    plt.ion()
+    Time = np.empty([0]);
+    totalPhotonRate = np.array([]);
+    im = np.empty([sizeY,sizeX,0]);
+    imBkgd = np.empty([sizeY,sizeX,0]) 
+    
+    tic = time.perf_counter()
+
+    #open camera shutter
+    cam.setup_shutter("open")
+    
+
+    try:
+        i=0
+        while True:
+            tic2 = time.perf_counter()
+                
+            
+            #randomly decide if background image is taken first or second
+            a = random.randint(0,1)
+            
+            if a==0:
+                #record time
+                Time = np.hstack((Time,time.time())) #time in seconds since the epoch
+                
+                # #close shutter
+                # print('Closing the shutter...')
+                # shutter.set_operating_state('Inactive')
+                # while is_open():
+                #     time.sleep(0.01)
+                # print('  Is the shutter open? {}'.format(is_open()))
+                
+                #move power meter into beam path
+                motor.write(down_position)
+                while open_or_closed()!=0:
+                    time.sleep(0.01)               
+                print('Power meter down')
+                
+                #take Bkgd images
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+1)[0]))
+                time.sleep(0.01)
+                
+                # #open shutter
+                # print('Opening the shutter...')
+                # shutter.set_operating_state('Active')
+                # while not is_open():
+                #     time.sleep(0.01)
+                # print('  Is the shutter open? {}'.format(is_open()))
+                
+                #move power meter out of beam path
+                motor.write(up_position)
+                while open_or_closed()!=1:
+                    time.sleep(0.01)
+                print('Power meter up')
+                
+                # if i % 10 ==0:
+                #     Power = np.append(Power,flip_power())
+                
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+1)[0]))
+                time.sleep(0.01)
+                
+            else:
+                #record time
+                Time = np.hstack((Time,time.time())) #time in seconds since the epoch
+                
+                # #open shutter
+                # print('Opening the shutter...')
+                # shutter.set_operating_state('Active')
+                # while not is_open():
+                #     time.sleep(0.01)
+                # print('  Is the shutter open? {}'.format(is_open()))
+                
+                #move power meter out of beam path
+                motor.write(up_position)
+                while open_or_closed()!=1:
+                    time.sleep(0.01)
+                print('Power meter up')
+        
+                # if i % 10 ==0:
+                #     Power = np.append(Power,flip_power())
+
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+1)[0]))
+                time.sleep(0.01)
+                
+                # #close shutter
+                # print('Closing the shutter...')
+                # shutter.set_operating_state('Inactive')
+                # while is_open():
+                #     time.sleep(0.01)
+                # print('  Is the shutter open? {}'.format(is_open()))
+                
+                #move power meter into beam path
+                motor.write(down_position)
+                while open_or_closed()!=0:
+                    time.sleep(0.01)               
+                print('Power meter down')
+            
+                #take Bkgd image   
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+1)[0]))
+                time.sleep(0.01)    
+
+                
+            #bkgd subtract the image
+            BkgdSubIm=im[:,:,i].astype(float)-imBkgd[:,:,i].astype(float)
+            #AvgBkgdSubIm=np.sum(np.array(im[8:26,7:25,0:i+1],dtype=np.int16),axis=2)/(i+1)-np.sum(np.array(imBkgd[8:26,7:25,0:i+1],dtype=np.int16),axis=2)/(i+1)
+            
+            #calculate total photon rate (not accurate for absolute #s)
+            totalPhotonRate = np.append(totalPhotonRate,np.sum(BkgdSubIm)*CCDsens/(gain*exp*QE))
+            print("power: W, total photon count rate: ",totalPhotonRate[i], "/s")
+            
+            
+            #plot the image
+            start=pint(i-50)
+            if i==0:
+                fig = plt.figure(figsize=(20, 15))
+                fig.patch.set_facecolor('black')
+                gs = GridSpec(nrows=2, ncols=2)
+                ax0 = fig.add_subplot(gs[:, 0])
+                ax2 = fig.add_subplot(gs[:, 1])
+                ax2.patch.set_facecolor('gray')
+                ax0.tick_params(colors='white', which='both') 
+                ax2.tick_params(colors='white', which='both')
+                plt.style.use("dark_background")
+                data0=ax0.imshow(BkgdSubIm)
+                cbar=plt.colorbar(data0,ax=ax0,orientation = 'horizontal') #shrink=0.6
+                cbar.set_label('ADU')
+                data2,=ax2.plot(np.linspace(start,i,(i-start)+1),totalPhotonRate[-51:],color='white')
+                ax0.set_xlabel('Pixel Number',fontsize=20,color='white');
+                ax0.set_ylabel('Pixel Number',fontsize=20,color='white');
+                ax0.set_title('Current Bkgd Sub Image',fontsize=30,color='white')
+                ax2.set_xlabel('Frame Number',fontsize=20,color='white');
+                ax2.set_ylabel('Photon Rate (photons/s)',fontsize=20,color='white');
+                ax2.set_title('Photon Rate',fontsize=30,color='white')
+                plt.show()
+                plt.pause(0.1)
+            else:
+                data0.set_data(BkgdSubIm)
+                data0.autoscale()
+                data2.set_data(np.linspace(start,i,(i-start)+1),totalPhotonRate[-51:])
+                ax2.relim()
+                ax2.autoscale_view()
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                
+            i+=1
+            toc2 = time.perf_counter()
+            print("time for frame: ", toc2-tic2)
+            
+    #stop measurement with control+c on console
+    except KeyboardInterrupt:
+        pass
+    
+    #close camera shutter
+    cam.setup_shutter("closed")
+        
+    #move the power meter out of the beam
+    motor.write(up_position)
+    while open_or_closed()!=1:
+        time.sleep(0.01)
+    print('Power meter up')
+    
+    toc = time.perf_counter()    
+    print("time to acquire: ", toc-tic)
+    
+    return
+
+
+####### function for measuring 1PEF (for concentration measurements) from LED excitation on EMCCD ###########
+####### for a defined number of frames ####################################
+
+#change filebase2 or risk overwriting data
+filebase2 ="E:/231105/Conc_"
+LEDfile = filebase2+"LED.pkl"
+LEDimfile = filebase2+"im.pkl"
+LEDBkgdfile = filebase2+"Bkgd.pkl"
+LEDstaticfile = filebase2+"static.pkl"
+
+
+def LED_flu(stop=50):
+    
+    #adjust EMCCD settings for this application
+    gain=1
+    exp = cam.set_exposure(0.5)
+    cam.set_EMCCD_gain(gain) # Set gain
+    binning=6#24#34#24#24
+    cam.set_roi(ROIx1, ROIx2, ROIy1, ROIy2, hbin=binning, vbin=binning)
+    sizeY=int((ROIy2-ROIy1)/binning)
+    sizeX=int((ROIx2-ROIx1)/binning)
+    
+    #close shutter
+    # print('Closing the shutter...')
+    # shutter.set_operating_state('Inactive')
+    # while is_open():
+    #     time.sleep(0.01)
+    # print('  Is the shutter open? {}'.format(is_open()))
+    
+    #turn on the LED
+    powerOnLED(3,3.00)
+    
+    Ctime = np.empty([0]);
+    PDVolt = np.empty([0]);
+    Power = np.empty([0]);
+    LEDCur = np.empty([0]);
+    LEDVolt = np.empty([0]);
+    IwaitTime = 120;  #time to warm up LED
+    totalPhotonRate = np.array([]);
+    im = np.empty([sizeY,sizeX,0]);
+    imBkgd = np.empty([sizeY,sizeX,0]) #np.zeros([frames,40,40]);
+    
+    data = {}
+    #get camera settings
+    data['settings'] = cam.get_full_info()
+    #characterize baseline and dark rate
+    data['baseline'], data['dark'] = characterize_baseline_dark(exp,sizeY,sizeX)
+    
+    tic = time.perf_counter()
+    
+    #try to get sensor to correct temp
+    i=0
+    while i<24/3:#5:
+        cam.grab(frame_timeout=exp+1)
+        time.sleep(0.01)
+        i+=1
+
+    #save static file
+    with open(LEDstaticfile, 'wb') as f:
+        pickle.dump(data,f)
+
+    #open camera shutter
+    cam.setup_shutter("open")
+    
+    #clear files
+    Fim = open(LEDimfile,'wb')
+    Fbkgd = open(LEDBkgdfile,'wb')
+    FLED = open(LEDfile,'wb')
+    Fim.close()
+    Fbkgd.close()
+    FLED.close()
+    
+    i=0;
+    
+    time.sleep(IwaitTime) #time to wait in seconds
+    for i in range(0,stop):
+        
+        tic2 = time.perf_counter()
+        
+        #randomly decide if background image is taken first or second
+        a = random.randint(0,1)
+        
+        if a==0:
+            #record time
+            Ctime = np.hstack((Ctime,time.time())) #time in seconds since the epoch
+            
+            # #close shutter
+            # print('Closing the shutter...')
+            # shutter.set_operating_state('Inactive')
+            # while is_open():
+            #     time.sleep(0.01)
+            # print('  Is the shutter open? {}'.format(is_open()))
+            
+            #power meter down
+            motor.write(down_position)
+            while open_or_closed()!=0:
+                time.sleep(0.01)               
+            print('Power meter down')
+            
+            #take Bkgd image
+            imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+            time.sleep(0.01)
+            
+            #power meter up
+            motor.write(up_position)
+            while open_or_closed()!=1:
+                time.sleep(0.01)
+            print('Power meter up')
+            
+            #take image
+            im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+            
+            #get LED power & settings
+            PDVolt = np.hstack((PDVolt,ReadVoltPhotoDiode()))
+            Power = np.hstack((Power,PowerFromVolt(PDVolt[-1])))
+            LEDCur = np.hstack((LEDCur,KEI2231_Query("MEAS:CURR?")))
+            LEDVolt = np.hstack((LEDVolt,KEI2231_Query("MEAS:VOLT?")))
+            
+            time.sleep(0.01)
+            
+        else:
+            #record time
+            Ctime = np.hstack((Ctime,time.time())) #time in seconds since the epoch
+            
+            #power meter up
+            motor.write(up_position)
+            while open_or_closed()!=1:
+                time.sleep(0.01)
+            print('Power meter up')
+           
+            #take image
+            im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+            
+            #get LED power & settings
+            PDVolt = np.hstack((PDVolt,ReadVoltPhotoDiode()))
+            Power = np.hstack((Power,PowerFromVolt(PDVolt[-1])))
+            LEDCur = np.hstack((LEDCur,KEI2231_Query("MEAS:CURR?")))
+            LEDVolt = np.hstack((LEDVolt,KEI2231_Query("MEAS:VOLT?")))
+            
+            time.sleep(0.01)
+            
+            # #close shutter
+            # print('Closing the shutter...')
+            # shutter.set_operating_state('Inactive')
+            # while is_open():
+            #     time.sleep(0.01)
+            # print('  Is the shutter open? {}'.format(is_open()))
+            
+            #power meter down
+            motor.write(down_position)
+            while open_or_closed()!=0:
+                time.sleep(0.01)               
+            print('Power meter down')
+        
+            #take Bkgd image   
+            imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+            time.sleep(0.01)    
+
+            
+        #bkgd subtract the image 
+        BkgdSubIm=im[:,:,i].astype(float)-imBkgd[:,:,i].astype(float)
+        
+        #calculate total photon rate (not accurate for absolute #s)
+        totalPhotonRate = np.append(totalPhotonRate,np.sum(BkgdSubIm)*CCDsens/(gain*exp*QE))
+        print("power: ",Power[-1],"W, total photon count rate: ",totalPhotonRate[i], "/s")
+        
+        #save data each frame in case measurement crashes before saving
+        with open(LEDfile, 'ab') as f:
+            pickle.dump([Ctime[-1],PDVolt[-1],Power[-1],LEDCur[-1],LEDVolt[-1]],f)
+        with open(LEDimfile, 'ab') as f:
+            pickle.dump(im[:,:,i],f)
+        with open(LEDBkgdfile, 'ab') as f:
+            pickle.dump(imBkgd[:,:,i],f)
+            
+        i+=1
+            
+        toc2 = time.perf_counter()
+        print("time for frame: ", toc2-tic2)
+        
+    #close camera shutter
+    cam.setup_shutter("closed")
+    
+    #turn off LED
+    KEI2231A_OutputState(0)
+    
+    #open shutter
+    # print('Opening the shutter...')
+    # shutter.set_operating_state('Active')
+    # while not is_open():
+    #     time.sleep(0.01)
+    # print('  Is the shutter open? {}'.format(is_open()))
+
+    toc = time.perf_counter()    
+    print("time to acquire: ", toc-tic)
+    return
+
+
+####### function for measuring 1PEF (for concentration measurements) from LED excitation on EMCCD ###########
+#### updated for undefined number of frames ##################################
+
+def LED_flu_2():
+    #adjust EMCCD settings for this application
+    gain=1
+    exp = cam.set_exposure(0.5)
+    cam.set_EMCCD_gain(gain) # Set gain
+    binning=6#24#34#24#24
+    cam.set_roi(ROIx1, ROIx2, ROIy1, ROIy2, hbin=binning, vbin=binning)
+    sizeY=int((ROIy2-ROIy1)/binning)
+    sizeX=int((ROIx2-ROIx1)/binning)
+    
+    #close shutter
+    print('Closing the shutter...')
+    shutter.set_operating_state('Inactive')
+    while is_open():
+        time.sleep(0.01)
+    print('  Is the shutter open? {}'.format(is_open()))
+    
+    #turn on LED
+    powerOnLED(3,3.02)
+    
+    #Itime = time.time()
+    Ctime = np.empty([0]);
+    PDVolt = np.empty([0]);
+    Power = np.empty([0]);
+    LEDCur = np.empty([0]);
+    LEDVolt = np.empty([0]);
+    IwaitTime = 120;   #time to warm up LED
+    totalPhotonRate = np.array([]);
+    im = np.empty([sizeY,sizeX,0]);
+    imBkgd = np.empty([sizeY,sizeX,0])
+    
+    data = {}
+    #get camera settings
+    data['settings'] = cam.get_full_info()
+    #characterize baseline and dark rate
+    data['baseline'], data['dark'] = characterize_baseline_dark(exp,sizeY,sizeX)
+    
+    tic = time.perf_counter()
+    #try to get sensor to correct temp
+    i=0
+    while i<24/3:#5:
+        cam.grab(frame_timeout=exp+1)
+        time.sleep(0.01)
+        i+=1
+    
+    #save staticfile data
+    with open(LEDstaticfile, 'wb') as f:
+        pickle.dump(data,f)
+
+    #open camera shutter
+    cam.setup_shutter("open")
+    
+    #clear files
+    Fim = open(LEDimfile,'wb')
+    Fbkgd = open(LEDBkgdfile,'wb')
+    FLED = open(LEDfile,'wb')
+    Fim.close()
+    Fbkgd.close()
+    FLED.close()
+    
+    i=0;
+    
+    time.sleep(IwaitTime) #time to wait in seconds
+    try:
+        i=0
+        while True:
+            
+            tic2 = time.perf_counter()
+            
+            #randomly decide if background image is taken first or second
+            a = random.randint(0,1)
+            
+            if a==0:
+                #record time
+                Ctime = np.hstack((Ctime,time.time())) #time in seconds since the epoch
+                
+                # #close shutter
+                # print('Closing the shutter...')
+                # shutter.set_operating_state('Inactive')
+                # while is_open():
+                #     time.sleep(0.01)
+                # print('  Is the shutter open? {}'.format(is_open()))
+                
+                #power meter down
+                motor.write(down_position)
+                while open_or_closed()!=0:
+                    time.sleep(0.01)               
+                print('Power meter down')
+                
+                #take Bkgd images
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+                time.sleep(0.01)
+                
+                #power meter up
+                motor.write(up_position)
+                while open_or_closed()!=1:
+                    time.sleep(0.01)
+                print('Power meter up')
+                
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+                
+                #get LED power & settings
+                PDVolt = np.hstack((PDVolt,ReadVoltPhotoDiode()))
+                Power = np.hstack((Power,PowerFromVolt(PDVolt[-1])))
+                LEDCur = np.hstack((LEDCur,KEI2231_Query("MEAS:CURR?")))
+                LEDVolt = np.hstack((LEDVolt,KEI2231_Query("MEAS:VOLT?")))
+                
+                time.sleep(0.01)
+                
+            else:
+                #record time
+                Ctime = np.hstack((Ctime,time.time())) #time in seconds since the epoch
+                
+                #power meter up
+                motor.write(up_position)
+                while open_or_closed()!=1:
+                    time.sleep(0.01)
+                print('Power meter up')
+               
+                #take image
+                im = np.dstack((im,cam.grab(frame_timeout=exp+2)[0]))
+                
+                #get LED power & settings
+                PDVolt = np.hstack((PDVolt,ReadVoltPhotoDiode()))
+                Power = np.hstack((Power,PowerFromVolt(PDVolt[-1])))
+                LEDCur = np.hstack((LEDCur,KEI2231_Query("MEAS:CURR?")))
+                LEDVolt = np.hstack((LEDVolt,KEI2231_Query("MEAS:VOLT?")))
+                
+                time.sleep(0.01)
+                
+                # #close shutter
+                # print('Closing the shutter...')
+                # shutter.set_operating_state('Inactive')
+                # while is_open():
+                #     time.sleep(0.01)
+                # print('  Is the shutter open? {}'.format(is_open()))
+                
+                #power meter down
+                motor.write(down_position)
+                while open_or_closed()!=0:
+                    time.sleep(0.01)               
+                print('Power meter down')
+            
+                #take Bkgd image   
+                imBkgd = np.dstack((imBkgd,cam.grab(frame_timeout=exp+2)[0]))
+                time.sleep(0.01)    
+    
+                
+            #bkgd subtract the image 
+            BkgdSubIm=im[:,:,i].astype(float)-imBkgd[:,:,i].astype(float)
+            
+            #calculate total photon rate (not accurate for absolute #s)
+            totalPhotonRate = np.append(totalPhotonRate,np.sum(BkgdSubIm)*CCDsens/(gain*exp*QE))
+            print("power: ",Power[-1],"W, total photon count rate: ",totalPhotonRate[i], "/s")
+            
+            #save data each frame in case measurement crashes before saving
+            with open(LEDfile, 'ab') as f:
+                pickle.dump([Ctime[-1],PDVolt[-1],Power[-1],LEDCur[-1],LEDVolt[-1]],f)
+            with open(LEDimfile, 'ab') as f:
+                pickle.dump(im[:,:,i],f)
+            with open(LEDBkgdfile, 'ab') as f:
+                pickle.dump(imBkgd[:,:,i],f)
+                
+            i+=1
+                
+            toc2 = time.perf_counter()
+            print("time for frame: ", toc2-tic2)
+            
+    #use control+c to stop measurement
+    except KeyboardInterrupt:
+        pass
+
+    #close camera shutter
+    cam.setup_shutter("closed")
+    
+    #turn off LED
+    KEI2231A_OutputState(0)
+    
+    #open shutter
+    print('Opening the shutter...')
+    shutter.set_operating_state('Active')
+    while not is_open():
+        time.sleep(0.01)
+    print('  Is the shutter open? {}'.format(is_open()))
+
+    toc = time.perf_counter()    
+    print("time to acquire: ", toc-tic)
+    return
+
+#uncomment the function you would like to run, comment other
+LED_flu_2()
+#LED_flu()
+#image_loop_2()
+#image_loop_E2PA()
+#image_loop_E2PA_2()
+#align_loop()
+
+#run corresponding commands to close devices
+
+#cam.setup_shutter("closed")
+motor.close()
+shutter.stop_polling()
+shutter.disconnect()
+#OphirCOM.CloseAll()
+# Release the object
+#OphirCOM = None
+
+#KEI2231A_OutputState(0)
+KEI2231A_Disconnect()
+rm.close
+photodiode.close()
+thermistorsW.close()
+thermistorsR.close()
+quadDetector.close()

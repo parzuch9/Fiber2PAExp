@@ -1,0 +1,244 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Aug  2 17:38:28 2023
+
+@author: Jimenez Lab
+"""
+
+import time
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import pickle
+from matplotlib.gridspec import GridSpec
+
+#camera
+from pylablib.devices import Andor # import Andor devices module
+cam = Andor.AndorSDK3Camera() 
+print('Connected to {}'.format(cam))
+#quad
+import nidaqmx
+from nidaqmx.constants import TerminalConfiguration
+#shutter
+import os
+from msl.equipment import EquipmentRecord, ConnectionRecord, Backend
+from msl.equipment.resources.thorlabs import MotionControl
+
+%matplotlib qt
+
+
+############################ Setup Shutter ####################################
+
+# ensure that the Kinesis folder is available on PATH
+os.environ['PATH'] += os.pathsep + 'C:/Program Files/Thorlabs/Kinesis'
+
+# rather than reading the EquipmentRecord from a database we can create it manually
+record = EquipmentRecord(
+    manufacturer='Thorlabs',
+    model='KSC101',
+    serial='68001764',  # update the serial number for your KSC101 (Kristen updated)
+    connection=ConnectionRecord(
+        backend=Backend.MSL,
+        address='SDK::Thorlabs.MotionControl.KCube.Solenoid.dll',
+    ),
+)
+# avoid the FT_DeviceNotFound error
+MotionControl.build_device_list()
+# connect to the KCube Solenoid
+shutter = record.connect()
+print('Connected to {}'.format(shutter))
+
+def is_open():
+    return shutter.get_operating_state() == 1
+
+# start polling at 200 ms
+shutter.start_polling(200)
+# set the operating mode to SC_OperatingModes.SC_Manual
+shutter.set_operating_mode('Manual')
+
+########################## Setup Quad Detector ###############################
+
+quadDetector = nidaqmx.Task(new_task_name='quad')
+test = quadDetector.ai_channels.add_ai_voltage_chan("Dev4/ai4",terminal_config=TerminalConfiguration.RSE) # B-T
+test2 = quadDetector.ai_channels.add_ai_voltage_chan("Dev4/ai5",terminal_config=TerminalConfiguration.RSE) # L-R
+test3 = quadDetector.ai_channels.add_ai_voltage_chan("Dev4/ai6",terminal_config=TerminalConfiguration.RSE) # sum
+print('Connected to {}'.format(quadDetector))
+
+def readQuadDetector(nSamples, qdet = quadDetector):
+    qdetReadings = np.mean(qdet.read(number_of_samples_per_channel = nSamples),axis=1)
+    return qdetReadings
+
+#################### Cool Camera, Adjust Settings #############################
+
+#print(cam.get_device_info())
+#print(cam.get_all_attributes())
+#print(cam.get_all_attribute_values())
+
+#cool camera
+cam.set_temperature(temperature=-25, enable_cooler=True)
+def is_cam_cool(cam,temp=-25,timeout=1200, period=20, *args, **kwargs):
+  mustend = time.time() + timeout
+  try:
+      while time.time() < mustend:
+          if cam.get_temperature() == temp: 
+              print("temperature stabilized")
+              return True
+          print("waiting for temperature to stabilize, temp = ",cam.get_temperature())
+          time.sleep(period)
+      print("timeout, not yet stable")
+      return False
+  except KeyboardInterrupt:
+      pass
+  return
+
+#is_cam_cool(cam)
+print("camera temperature: ", cam.get_temperature())
+
+#set exposure
+exp = cam.set_exposure(1)#(10); #sec
+#switch to low noise mode (12-bit): 0, 16-bit: 1
+cam.set_attribute_value('SimplePreAmpGainControl',0)
+#cam.SpuriousNoiseFilter = 1
+
+################## Save Image to File ########################################
+# Save one Image and then one Bkgd = True image, but change filepath to bkgd file
+
+#change filepath each time or overwrite previous data
+file ="E:/231105/test"
+#file =file+"_bkgd"
+
+def save_image(cam=cam, bkgd=False, ExpTime=0.0625, file = file):
+        # save data to pkl 
+
+    cam.set_exposure(ExpTime)
+    cam.set_shutter("open")
+    
+    test = cam.grab(1)
+    if bkgd==False:
+        while np.max(test)>4090:
+            ExpTime=ExpTime/2
+            cam.set_exposure(ExpTime)
+            print("new exposure time = ",cam.get_exposure())
+            test = cam.grab(1)
+        while np.max(test)<400:
+            ExpTime=ExpTime*2
+            cam.set_exposure(ExpTime)
+            print("new exposure time = ",cam.get_exposure())
+            test = cam.grab(1)
+    else:
+        file=file+"_bkgd"
+  
+    data = {}
+    data['quad1'] = readQuadDetector(5)
+    data['img'] = cam.grab(10)
+    data['quad2'] = readQuadDetector(5)
+    data['settings'] = cam.get_full_info()
+    
+    cam.set_shutter("closed")
+    
+    with open(file+".pkl",'wb') as f:
+        pickle.dump(data,f,-1)
+
+    return
+
+
+##### Align light onto sCMOS thru fiber, maximize power normalized photon rate #####
+
+def pint(value):
+    if value>=0:
+        return value
+    else:
+        return 0
+
+def align(cam=cam,ExpTime=0.0625):
+    plt.ion()
+    #Power = np.array([]);
+    #Time = np.empty([0]);
+    totalPhotonRateNorm = np.array([]);
+    im = np.empty([2048,2048,0]);
+    
+    cam.set_exposure(ExpTime)
+    Counts2photonRate = 1/(0.6*ExpTime)
+    try:
+        i=0
+        while True:
+            tic2 = time.perf_counter()
+            
+            #open shutter
+            print('Opening the shutter...')
+            shutter.set_operating_state('Active')
+            while not is_open():
+                time.sleep(0.001)
+            print('  Is the shutter open? {}'.format(is_open()))
+            
+            quad1 = readQuadDetector(5)
+            im = cam.grab(2)
+            quad2 = readQuadDetector(5)
+            avgSum = (quad1[2]+quad2[2])/2
+            avgPower = avgSum/0.00681
+            
+            #close shutter
+            print('Closing the shutter...')
+            shutter.set_operating_state('Inactive')
+            while is_open():
+                time.sleep(0.001)
+            print('  Is the shutter open? {}'.format(is_open()))
+            
+            imBkgd = cam.grab(2)
+    
+            #avg the image
+            AvgIm = np.mean(im,axis=0).astype(float)-np.mean(imBkgd,axis=0).astype(float)
+            #AvgBkgdSubIm=np.sum(np.array(im[8:26,7:25,0:i+1],dtype=np.int16),axis=2)/(i+1)-np.sum(np.array(imBkgd[8:26,7:25,0:i+1],dtype=np.int16),axis=2)/(i+1)
+    
+            #calculate total photon rate (not accurate for absolute numbers)
+            totalPhotonRateNorm = np.append(totalPhotonRateNorm,np.sum(AvgIm,dtype="int64")*Counts2photonRate/avgPower)
+            print("power norm photon count rate: ",totalPhotonRateNorm[i], "/(s*mW)")
+            
+            #plot the image
+            start=pint(i-50)
+            if i==0:
+                fig = plt.figure(figsize=(20, 15))
+                fig.patch.set_facecolor('black')
+                gs = GridSpec(nrows=2, ncols=2)
+                ax0 = fig.add_subplot(gs[:, 0])
+                ax2 = fig.add_subplot(gs[:, 1])
+                ax2.patch.set_facecolor('gray')
+                ax0.tick_params(colors='white', which='both') 
+                ax2.tick_params(colors='white', which='both')
+                plt.style.use("dark_background")
+                data0=ax0.imshow(AvgIm)
+                cbar=plt.colorbar(data0,ax=ax0,orientation = 'horizontal') #shrink=0.6
+                cbar.set_label('ADU')
+                data2,=ax2.plot(np.linspace(start,i,(i-start)+1),totalPhotonRateNorm[-51:],color='white')
+                ax0.set_xlabel('Pixel Number',fontsize=20,color='white');
+                ax0.set_ylabel('Pixel Number',fontsize=20,color='white');
+                ax0.set_title('Current Bkgd Sub Image',fontsize=30,color='white')
+                ax2.set_xlabel('Frame Number',fontsize=20,color='white');
+                ax2.set_ylabel('Norm Photon Rate (photons/s/mw)',fontsize=20,color='white');
+                ax2.set_title('Photon Rate',fontsize=30,color='white')
+                plt.show()
+                plt.pause(0.1)
+            else:
+                data0.set_data(AvgIm)
+                data0.autoscale()
+                data2.set_data(np.linspace(start,i,(i-start)+1),totalPhotonRateNorm[-51:])
+                ax2.relim()
+                ax2.autoscale_view()
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+
+            i+=1
+            toc2 = time.perf_counter()
+            print("time for frame: ", toc2-tic2)
+    
+    except KeyboardInterrupt:
+        pass
+    
+    return
+
+################ run these commands before rerunning script ###################
+#quadDetector.close()
+#motor.close()
+#shutter.stop_polling()
+#shutter.disconnect()
+#cam.close()
